@@ -7,3 +7,6 @@
 **/*.quarto_ipynb
 /index_cache/
 .positai
+
+# Institute Docs
+/capi-docs

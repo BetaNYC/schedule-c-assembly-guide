@@ -1,5 +1,6 @@
 ---
-title: "Example RADAR Report"
+title: "Assembling a New York City Council Discretionary Funding Dataset"
+subtitle: "FY 2006 - 2026"
 format: 
   html:
     code-fold: true
@@ -28,7 +29,10 @@ reqd_pkgs <- c("flextable",
                "mapgl",
                "mapview",
                "DBI",
-               "RPostgres")
+               "RPostgres",
+               "httr2",
+               "rvest",
+               "readxl")
 
 install.packages(
   setdiff(
@@ -60,115 +64,372 @@ readRenviron(".Renviron")
 source("cil_table.R")
 ```
 
-This branch is for a brief RADAR report example that includes examples of typical elements:
+## Data sources
 
-* Code blocks
-* Inline code
-* Hyperlinks 
-* Graphs
-* Interactive maps
-* Block quotes
-
-The code block above contains per-block rendering options, denoted by `#|`. Look, code formatting! Required packages are then written to a character vector `reqd_pkgs` which is used to compare against already-installed R packages using the `setdiff()` function.
-
-Once packages are installed, they may be used by calling the `library()` function. The common packages used here are:
-
-* `flextable`: used for tables, flexible and extensible, hence the name
-* `sf`: the standard package for geospatial work in R -- introduces spatial objects and operations
-* `tidyverse`: a collection of packages used for working with data, all centered around the [tidy]("https://vita.had.co.nz/papers/tidy-data.pdf") framework
-* `mapgl`: an R implementation of the two common OpenGL-based map frameworks, Mapbox GL JS and MapLibre GL JS
-
-Let's set up some elements using the built-in datasets that come with R and the above packages.
-
-To render the report as `docs/index.html`, run `quarto render index.qmd` from the command line in the repo root.
-
-One of the packages in `tidyverse` is the popular `ggplot2`, used to create data analysis graphics using the "Grammar of Graphics". A useful reference is the online book [ggplot2: Elegant Graphics for Data Analysis (3e)]("https://ggplot2-book.org/"), which was made with Quarto!
-
-The number of diamonds by color and cut in the built in `diamonds` data set can be visualized using a stacked bar chart. We'll define the category color manually:
+The chunks in this section download each source as published into `data/raw/`. By default, they do not run when the notebook is rendered. Download them by hand by setting the `eval` chunk option to `true`. Each download overwrites the files in `data/raw/` and rewrites `data/raw/manifest.csv`.
 
 ```{r}
-#| out-width: 100%
-#| code-fold: false
+#| label: raw-helpers
+#| eval: true
 
-ggplot(data = diamonds,
-       aes(color, fill = cut)) +
-  geom_bar() + 
-  xlab("Color Category") +
-  ylab("Count") +
-  labs(title = "Diamonds by Color and Cut",
-       subtitle = "Source: diamonds (built-in dataset)") +
-  scale_fill_discrete(name = "Color Category",
-                      palette = c("#f1eef6",
-                                  "#bdc9e1",
-                                  "#74a9cf",
-                                  "#2b8cbe",
-                                  "#045a8d")) +
-  theme_gray(base_size = 16)
-```
+raw_dir <- "data/raw"
 
-Virtually every element of a `ggplot` graphic can be modified. Let's say we want to remove the panel shading, leaving only y-axis major grid lines in a light grey, and update the text color to a softer black:
-
-```{r}
-#| out-width: 100%
-#| code-fold: false
-
-ggplot(data = diamonds,
-       aes(color, fill = cut)) +
-  geom_bar() + 
-  xlab("Color Category") +
-  ylab("Count") +
-  labs(title = "Diamonds by Color and Cut",
-       subtitle = "Source: diamonds (built-in dataset)") +
-  scale_fill_discrete(name = "Color Category",
-                      palette = c("#f1eef6",
-                                  "#bdc9e1",
-                                  "#74a9cf",
-                                  "#2b8cbe",
-                                  "#045a8d")) +
-  scale_y_continuous( breaks = seq(0, 30000, by = 5000)) +
-  theme_gray(base_size = 16) +
-  theme(
-    panel.background = element_blank(),
-    panel.grid.major.y = element_line(color = "grey80"),
-    panel.grid.major.x = element_blank(),
-    panel.grid.minor.x = element_blank(),
-    axis.ticks = element_blank(),
-    text = element_text(color = "#141414"),
-    axis.text = element_text(color = "#141414")
+# One manifest row per downloaded file. The Council reissues its workbooks
+# under the same file name, so the download time and checksum are what tell
+# two copies of a fiscal year apart.
+manifest_row <- function(source, item, path, url, source_modified = NA, rows = NA) {
+  tibble(
+    source          = source,
+    item            = as.character(item),
+    path            = path,
+    url             = url,
+    fetched_at      = format(Sys.time(), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC"),
+    source_modified = as.character(source_modified),
+    bytes           = file.size(path),
+    rows            = as.integer(rows),
+    sha256          = unname(tools::sha256sum(path))
   )
+}
+
+# Saves a file byte-for-byte and returns the server's Last-Modified date.
+download_raw <- function(url, path) {
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  modified <- request(url) |>
+    req_retry(max_tries = 3) |>
+    req_perform(path = path) |>
+    resp_header("last-modified")
+  if (is.null(modified)) return(NA)
+  format(curl::parse_date(modified), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+}
+
+cil_table(
+  tribble(
+    ~`Manifest Column`, ~Description,
+    "source", "Source file type: open_data, workbook or schedule_c.",
+    "item", "The dataset ID for Open Data. The fiscal year for workbooks and Schedule C.",
+    "path", "Where the file was saved, relative to the project root.",
+    "url", "The address the file was downloaded from.",
+    "fetched_at", "When the file was downloaded, in UTC.",
+    "source_modified", "When the publisher last changed the file, in UTC. For Open Data, the dataset's last data update. For workbooks and Schedule C, the server's Last-Modified header.",
+    "bytes", "Size of the saved file in bytes.",
+    "rows", "Number of rows in the table. Recorded for Open Data only.",
+    "sha256", "SHA-256 checksum of the saved file."
+  )
+)
 ```
 
-And so and and so on. LLMs are good with helping with the arcane little tweaks for plots.
+### NYC Open Data
 
-The `sf` package has a built in dataset of SIDS sample data in North Carolina. Let's use `mapgl` to take a look at area by county:
+Four tables, read with `{socratadata}` and written to CSV.
 
 ```{r}
-#| message: false
-#| warning: false
-#| code-fold: false
-#| out-height: 800px
+#| label: open-data-table
+#| echo: false
 
-nc <- st_read(system.file("shape/nc.shp", package="sf"),
-              quiet = TRUE)
-
-maplibre_view(nc, column = "AREA")
+cil_table(
+  tribble(
+    ~Dataset, ~ID,
+    "City Council Discretionary Funding", "4d7f-74pe",
+    "City Council Members, 1999 to Present", "uvw5-9znb",
+    "Discretionary Award Tracker", "ujre-m2tj",
+    "Recent Contract Awards", "qyyg-4tf5"
+  ),
+  full_height = TRUE
+)
 ```
-<br/ >
-How about a table of the same information? Flextable is a little tricky in that its output is rendered as an HTML widget that generates its own HTML that gets injected into the page. To control the vertical height and overflow using `styles.css` you have to wrap the class using the `html_tools` package:
+
 ```{r}
-#| code-fold: FALSE
+#| label: raw-open-data
+#| eval: false
 
-nc |>
-  st_drop_geometry() |>
-  cil_table()
+open_data <- c(
+  council_discretionary_funding = "4d7f-74pe",
+  council_members               = "uvw5-9znb",
+  discretionary_award_tracker   = "ujre-m2tj",
+  recent_contract_awards        = "qyyg-4tf5"
+)
+
+manifest_open_data <- imap(open_data, \(id, name) {
+  url  <- paste0("https://data.cityofnewyork.us/d/", id)
+  path <- file.path(raw_dir, "open_data", paste0(name, "_", id, ".csv"))
+  dir.create(dirname(path), recursive = TRUE, showWarnings = FALSE)
+  # alias = "drop" keeps the API field names (mocs_id, council_member) instead
+  # of the display labels.
+  data <- soc_read(url, alias = "drop")
+  updated <- format(attr(data, "data_last_updated"), "%Y-%m-%dT%H:%M:%SZ", tz = "UTC")
+  # A Socrata url column arrives as a nested url/description pair. The portal's
+  # own CSV export writes the url alone, so that is what is written here.
+  data <- mutate(data, across(where(is.data.frame), \(x) x$url))
+  # The portal publishes dates as midnight with no time zone. Written as the
+  # date alone, so a UTC conversion cannot move them.
+  data <- mutate(data, across(where(is.POSIXct), as_date))
+  write_csv(data, path, na = "")
+  manifest_row("open_data", id, path, url, updated, nrow(data))
+}) |>
+  list_rbind()
 ```
-<br/ >
-Here's an example citation: Kittredge (2026)[^1].
 
-[^1]: [Kittredge, Andrew P. "The Title of a Fake, Nonexistent Paper" Pretend Journal 45.3 (2026): 741-895.](https://en.wikipedia.org/wiki/Smiley#/media/File:Smiley.svg)
+### Disclosure workbooks
 
-And a bit of ol Lorem ipsum:
+`funded_disclosure_FY####`, one Excel file per fiscal year, FY2009 through FY2026, saved as published. These are the files the Council's [expense funding search](https://rnd.council.nyc.gov/expense_funding/) loads.
 
-> Lorem ipsum dolor sit amet, consectetur adipiscing elit, sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat. Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.
+```{r}
+#| label: raw-workbooks
+#| eval: false
 
-The end!
+manifest_workbooks <- map(2009:2026, \(fy) {
+  file <- paste0("funded_disclosure_FY", fy, if (fy <= 2013) ".xls" else ".xlsx")
+  url  <- paste0("https://rnd.council.nyc.gov/src/assets/excelFund/", file)
+  path <- file.path(raw_dir, "workbooks", file)
+  modified <- download_raw(url, path)
+  manifest_row("workbook", fy, path, url, modified)
+}) |>
+  list_rbind()
+```
+
+### Schedule C
+
+The Adopted Expense Budget Adjustment Summary, FY2008 through FY2027. There is no index of these PDFs: each is linked from its fiscal year's page at `council.nyc.gov/budget/fy####/`. The FY2011 page links two documents, a Schedule C and the Changes Pursuant to Section 254; both are downloaded.
+
+```{r}
+#| label: raw-schedule-c
+#| eval: false
+
+manifest_schedule_c <- map(2008:2027, \(fy) {
+  page  <- paste0("https://council.nyc.gov/budget/fy", fy, "/")
+  links <- read_html(page) |> html_elements("a")
+  links <- tibble(
+    text = html_text2(links),
+    url  = xml2::url_absolute(html_attr(links, "href"), page)
+  ) |>
+    filter(str_detect(url, regex("\\.pdf$", ignore_case = TRUE)))
+
+  schedule_c <- links |>
+    filter(str_detect(text, regex("schedule c", ignore_case = TRUE))) |>
+    slice(1) |>
+    mutate(file = paste0("Schedule_C_FY", fy, ".pdf"))
+  # From FY2020 on, "Section 254" on these pages titles capital budget
+  # documents, so it is only followed for FY2011.
+  section_254 <- links |>
+    filter(fy == 2011, str_detect(text, regex("section 254", ignore_case = TRUE))) |>
+    slice(1) |>
+    mutate(file = paste0("Schedule_C_FY", fy, "_Section_254.pdf"))
+
+  if (nrow(schedule_c) == 0) stop("No Schedule C link on ", page, call. = FALSE)
+
+  bind_rows(schedule_c, section_254) |>
+    pmap(\(text, url, file) {
+      path <- file.path(raw_dir, "schedule_c", file)
+      modified <- download_raw(url, path)
+      manifest_row("schedule_c", fy, path, url, modified)
+    }) |>
+    list_rbind()
+}) |>
+  list_rbind()
+```
+
+### Manifest
+
+```{r}
+#| label: raw-manifest
+#| eval: false
+
+bind_rows(manifest_open_data, manifest_workbooks, manifest_schedule_c) |>
+  write_csv(file.path(raw_dir, "manifest.csv"))
+```
+
+### Reference tables
+
+The Institute's reference tables are read from `capi-docs/Council_Discretionary_Reference_Tables.xlsx`. They are not downloaded.
+
+## Build
+
+### Reading the disclosure workbooks
+
+The eighteen workbooks are read into one table. Each file's first tab is read with every column as text. Nothing is cleaned at this stage.
+
+Column names change from year to year. Each published header is renamed to match the fields used in the NYC Open Data datasets.
+
+```{r}
+#| label: workbook-crosswalk
+
+workbook_crosswalk <- tribble(
+  ~open_data_name,              ~workbook_header,
+  "mocs_id",                    "MOCS ID#",
+  "fiscal_year",                "Fiscal Year",
+  "source",                     "Source",
+  "council_member",             "Council Member",
+  "council_member",             "Council Members",
+  "legal_name_of_organization", "Legal Name",
+  "legal_name_of_organization", "Legal Name of Organization",
+  "legal_name_of_organization", "Legal Name of Organization Requesting Funding",
+  "ein",                        "EIN",
+  "ein",                        "Tax ID",
+  "status",                     "Status",
+  "amount",                     "Amount",
+  "amount",                     "Amount ($)",
+  "amount",                     "Amount ($",
+  "agency",                     "Agency",
+  "program_name",               "Program Name",
+  "address",                    "Street Address 1",
+  "address",                    "Address",
+  "address",                    "Grantee Street Address 1",
+  "address_2_optional",         "Street Address 2",
+  "address_2_optional",         "Address 2 (optional)",
+  "address_2_optional",         "Address 2",
+  "address_2_optional",         "Address 2 (optional",
+  "address_2_optional",         "Grantee Street Address 2",
+  "city",                       "City",
+  "state",                      "State",
+  "postcode",                   "Zip Code",
+  "postcode",                   "Postal Code",
+  "purpose_of_funds",           "Purpose of Funds",
+  "purpose_of_funds",           "Purpose to be listed in Schedule C",
+  "purpose_of_funds",           "CM Purpose of Funds",
+  "fiscal_conduit_name",        "Fiscal Conduit Name",
+  "fiscal_conduit_name",        "Fiscal Conduit",
+  "fc_ein",                     "FC EIN",
+  "fc_ein",                     "Fiscal Conduit EIN"
+)
+
+workbook_paths <- list.files(file.path(raw_dir, "workbooks"), full.names = TRUE)
+workbook_fy    <- as.integer(str_extract(basename(workbook_paths), "\\d{4}"))
+```
+
+```{r}
+#| label: workbook-crosswalk-table
+#| echo: false
+
+# Collapses a set of fiscal years into ranges: FY2009–2011, FY2013.
+fy_ranges <- function(fy) {
+  fy   <- sort(unique(fy))
+  runs <- split(fy, cumsum(c(1, diff(fy) != 1)))
+  map_chr(runs, \(run) {
+    if (length(run) == 1) paste0("FY", run) else paste0("FY", min(run), "–", max(run))
+  }) |>
+    paste(collapse = ", ")
+}
+
+# The years come from the headers in the files themselves.
+workbook_headers <- map2(workbook_paths, workbook_fy, \(path, fy) {
+  tibble(fiscal_year = fy, workbook_header = names(read_excel(path, sheet = 1, n_max = 0)))
+}) |>
+  list_rbind()
+
+workbook_crosswalk |>
+  left_join(workbook_headers, by = "workbook_header") |>
+  summarise(fiscal_years = fy_ranges(fiscal_year), .by = c(open_data_name, workbook_header)) |>
+  rename(
+    `Open Data name`  = open_data_name,
+    `Workbook header` = workbook_header,
+    `Fiscal years`    = fiscal_years
+  ) |>
+  cil_table(full_height = TRUE)
+```
+
+Seven workbooks, FY2009 through FY2014 and FY2016, have no fiscal year column. For those the year is taken from the file name.
+
+The FY2024 workbook has seventeen rows below its last award: twelve empty rows and five rows of totals. Rows with neither a source nor a legal name are dropped on read. No other workbook has rows meeting this condition.
+
+```{r}
+#| label: read-workbooks
+
+is_blank <- function(x) is.na(x) | str_trim(x) == ""
+
+read_workbook <- function(path, fy) {
+  # trim_ws = FALSE keeps leading and trailing spaces in the values as published.
+  data <- read_excel(path, sheet = 1, col_types = "text", trim_ws = FALSE)
+
+  unmapped <- setdiff(names(data), workbook_crosswalk$workbook_header)
+  if (length(unmapped) > 0) {
+    stop(basename(path), " has a header the crosswalk does not cover: ",
+         paste(unmapped, collapse = ", "), call. = FALSE)
+  }
+  names(data) <- workbook_crosswalk$open_data_name[match(names(data), workbook_crosswalk$workbook_header)]
+
+  if (!"fiscal_year" %in% names(data)) data$fiscal_year <- as.character(fy)
+
+  filter(data, !(is_blank(source) & is_blank(legal_name_of_organization)))
+}
+
+workbooks <- map2(workbook_paths, workbook_fy, read_workbook) |>
+  list_rbind() |>
+  select(all_of(unique(workbook_crosswalk$open_data_name)))
+```
+
+### Reading the Open Data table
+
+City Council Discretionary Funding (4d7f-74pe) is read from the downloaded CSV with every column as text, as the workbooks are.
+
+```{r}
+#| label: read-open-data
+
+open_data_funding <- read_csv(
+  file.path(raw_dir, "open_data", "council_discretionary_funding_4d7f-74pe.csv"),
+  col_types = cols(.default = col_character()),
+  na = ""
+)
+```
+
+### Comparing the workbooks with Open Data
+
+The two sources cover the same designations for FY2009 through FY2021. A workbook row and an Open Data row are counted as the same award when fiscal year, source, organization name, and amount all agree. Before comparing, names are lowercased, punctuation is removed, and repeated spaces are collapsed; sources are lowercased and their spaces collapsed; amounts are written to two decimal places. Where a key appears more than once in a year, rows are paired off one for one.
+
+```{r}
+#| label: compare-sources
+
+match_keys <- function(data) {
+  data |>
+    transmute(
+      fiscal_year = as.integer(fiscal_year),
+      amount      = as.numeric(amount),
+      key = paste(
+        str_squish(str_to_lower(source)),
+        str_squish(str_remove_all(str_to_lower(legal_name_of_organization), "[[:punct:]]")),
+        sprintf("%.2f", amount),
+        sep = "|"
+      )
+    )
+}
+
+workbook_keys  <- match_keys(workbooks)
+open_data_keys <- match_keys(open_data_funding)
+
+source_totals <- full_join(
+  summarise(workbook_keys, workbook_rows = n(), workbook_amount = sum(amount), .by = fiscal_year),
+  summarise(open_data_keys, open_data_rows = n(), open_data_amount = sum(amount), .by = fiscal_year),
+  by = "fiscal_year"
+)
+
+source_matches <- full_join(
+  count(workbook_keys, fiscal_year, key, name = "in_workbook"),
+  count(open_data_keys, fiscal_year, key, name = "in_open_data"),
+  by = c("fiscal_year", "key")
+) |>
+  replace_na(list(in_workbook = 0, in_open_data = 0)) |>
+  summarise(
+    matched        = sum(pmin(in_workbook, in_open_data)),
+    workbook_only  = sum(pmax(in_workbook - in_open_data, 0)),
+    open_data_only = sum(pmax(in_open_data - in_workbook, 0)),
+    .by = fiscal_year
+  )
+
+source_comparison <- source_totals |>
+  left_join(source_matches, by = "fiscal_year") |>
+  arrange(fiscal_year) |>
+  # Open Data stops at FY2021, so there is nothing to match against after it.
+  mutate(across(c(matched, workbook_only, open_data_only), \(x) if_else(is.na(open_data_rows), NA, x)))
+
+source_comparison |>
+  transmute(
+    `Fiscal year`    = paste0("FY", fiscal_year),
+    `Workbook rows`  = workbook_rows,
+    `Open Data rows` = open_data_rows,
+    Matched          = matched,
+    `Workbook only`  = workbook_only,
+    `Open Data only` = open_data_only,
+    `Workbook $ minus Open Data $` = round(workbook_amount - open_data_amount)
+  ) |>
+  mutate(across(-`Fiscal year`, \(x) if_else(is.na(x), "", format(x, big.mark = ",", trim = TRUE)))) |>
+  cil_table(full_height = TRUE)
+```
